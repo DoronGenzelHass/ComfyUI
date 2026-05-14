@@ -878,6 +878,117 @@ paths:
           description: Preview not found
 
   # ---------------------------------------------------------------------------
+  # Server-side model downloads
+  # ---------------------------------------------------------------------------
+  /api/models-availability-status:
+    post:
+      operationId: postModelsAvailabilityStatus
+      tags: [model]
+      summary: Bulk check whether models are available, missing, or being downloaded
+      description: |
+        Given a list of model_ids (each of the form `<directory>/<filename>`,
+        e.g. `loras/my_lora.safetensors`), returns three lists partitioning
+        them: `available` (already on disk), `missing` (not on disk and not
+        being downloaded), and `downloading` (in-flight on the server, with
+        per-session progress). The frontend uses this to drive a missing-models
+        UI without polling the filesystem itself.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AvailabilityStatusRequest"
+      responses:
+        "200":
+          description: Partitioned status of the requested models.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AvailabilityStatusResponse"
+        "400":
+          description: Malformed request body.
+
+  /api/missing-models-metadata:
+    post:
+      operationId: postMissingModelsMetadata
+      tags: [model]
+      summary: Probe remote URLs for file size and gated status
+      description: |
+        Takes a map of model_id → URL and HEAD-checks each URL to surface its
+        `Content-Length` and whether the host is gating the file (e.g. a
+        HuggingFace 401/403 response). Used by the frontend to render
+        appropriately on the missing-models card.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MissingModelsMetadataRequest"
+      responses:
+        "200":
+          description: Per-model metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MissingModelsMetadataResponse"
+        "400":
+          description: Malformed request body.
+
+  /api/download-models:
+    post:
+      operationId: postDownloadModels
+      tags: [model]
+      summary: Start a server-side download of one or more models
+      description: |
+        Schedules downloads for every model_id in the request map. Returns
+        immediately after validation; progress is observed via
+        `/api/models-availability-status`. Fails atomically if any model
+        is already on disk, already downloading, gated, or has a URL that
+        is not on the server's allowlist (HuggingFace, Civitai, localhost).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DownloadModelsRequest"
+      responses:
+        "202":
+          description: Downloads accepted and scheduled.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DownloadModelsResponse"
+        "400":
+          description: One of the requested models is invalid, gated, or has a non-allowed URL.
+        "409":
+          description: One of the requested models is already on disk or downloading.
+
+  /api/cancel-model-download-session:
+    post:
+      operationId: postCancelModelDownloadSession
+      tags: [model]
+      summary: Cancel an in-flight server-side model download
+      description: |
+        Cancels the download session for the given model_id. The worker
+        observes the cancellation between chunks, removes its partial `.tmp`
+        file, and exits without writing the destination path.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CancelDownloadSessionRequest"
+      responses:
+        "200":
+          description: Session cancelled.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CancelDownloadSessionResponse"
+        "404":
+          description: No active download for that model_id.
+
+  # ---------------------------------------------------------------------------
   # Users
   # ---------------------------------------------------------------------------
   /api/users:
@@ -6151,6 +6262,150 @@ components:
           type: integer
           format: int64
           description: File size in bytes
+
+    # -------------------------------------------------------------------
+    # Server-side model downloads
+    # -------------------------------------------------------------------
+    AvailabilityStatusRequest:
+      type: object
+      description: Model_ids to query for availability/in-progress state.
+      properties:
+        model_ids:
+          type: array
+          description: List of `<directory>/<filename>` identifiers.
+          items:
+            type: string
+      required:
+        - model_ids
+
+    AvailabilityStatusResponse:
+      type: object
+      description: Partitioned status of the requested models.
+      required:
+        - available
+        - missing
+        - downloading
+      properties:
+        available:
+          type: array
+          description: Model_ids already present on disk.
+          items:
+            type: string
+        missing:
+          type: array
+          description: Model_ids not on disk and not being downloaded.
+          items:
+            type: string
+        downloading:
+          type: array
+          description: Model_ids currently downloading, with progress.
+          items:
+            $ref: "#/components/schemas/DownloadingEntry"
+
+    DownloadingEntry:
+      type: object
+      description: In-flight download progress for a single model_id.
+      required:
+        - model_id
+        - bytes_downloaded
+      properties:
+        model_id:
+          type: string
+        progress:
+          type: number
+          format: float
+          nullable: true
+          description: Fraction in [0,1]; null until Content-Length is known.
+        bytes_downloaded:
+          type: integer
+          format: int64
+        total_bytes:
+          type: integer
+          format: int64
+          nullable: true
+          description: Content-Length when supplied by the server.
+
+    MissingModelsMetadataRequest:
+      type: object
+      description: Map of model_id → URL to probe.
+      required:
+        - models
+      properties:
+        models:
+          type: object
+          additionalProperties:
+            type: string
+          description: model_id → URL.
+
+    MissingModelsMetadataResponse:
+      type: object
+      description: Probe results keyed by model_id.
+      required:
+        - models
+      properties:
+        models:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/MissingModelMetadataEntry"
+
+    MissingModelMetadataEntry:
+      type: object
+      description: Per-model result of a HEAD probe against the declared URL.
+      properties:
+        file_size:
+          type: integer
+          format: int64
+          nullable: true
+          description: Content-Length from the HEAD response, when readable.
+        is_gated:
+          type: boolean
+          description: True iff the URL is on huggingface.co and the HEAD returned 401/403/451.
+
+    DownloadModelsRequest:
+      type: object
+      description: Map of model_id → URL of files to fetch into the model folders.
+      required:
+        - models
+      properties:
+        models:
+          type: object
+          additionalProperties:
+            type: string
+          description: model_id → URL of models to download.
+
+    DownloadModelsResponse:
+      type: object
+      description: Acknowledgement that downloads have been scheduled.
+      required:
+        - accepted
+        - scheduled
+      properties:
+        accepted:
+          type: boolean
+          description: Always true; the request was scheduled.
+        scheduled:
+          type: array
+          items:
+            type: string
+          description: The list of model_ids whose downloads are now in-flight.
+
+    CancelDownloadSessionRequest:
+      type: object
+      description: Request to cancel an in-flight download for a given model_id.
+      required:
+        - model_id
+      properties:
+        model_id:
+          type: string
+
+    CancelDownloadSessionResponse:
+      type: object
+      description: Result of a cancellation request.
+      required:
+        - cancelled
+      properties:
+        cancelled:
+          type: boolean
 
     # -------------------------------------------------------------------
     # Subgraphs

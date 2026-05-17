@@ -963,6 +963,66 @@ paths:
         "409":
           description: One of the requested models is already on disk or downloading.
 
+  /api/hf-auth-token-status:
+    get:
+      operationId: getHfAuthTokenStatus
+      tags: [model]
+      summary: Whether the server holds a usable HuggingFace OAuth token
+      description: |
+        Returns ``token_available: true`` when the server has a token
+        in memory (or on disk) for HuggingFace, irrespective of whether
+        the access_token is currently fresh — an expired one with a
+        refresh_token still counts as "logged in" because we'll refresh
+        transparently on next use. If a username is resolvable via
+        ``HfApi.whoami`` we return that too, for the settings UI.
+      responses:
+        "200":
+          description: Token status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HfAuthTokenStatusResponse"
+
+  /api/hf-auth-login-start:
+    post:
+      operationId: postHfAuthLoginStart
+      tags: [model]
+      summary: Begin a HuggingFace OAuth login flow
+      description: |
+        Spawns a short-lived loopback callback server (port 41954) and
+        returns the URL the frontend should open in a new tab. After the
+        user grants consent, HF redirects back to the callback URL with
+        an authorization code; the server exchanges that for a token and
+        persists it. Subsequent ``/api/hf-auth-token-status`` calls will
+        return ``token_available: true``. Rejected with 403 if the
+        deployment is not eligible (not loopback or in --multi-user mode);
+        409 if another login attempt is already in progress.
+      responses:
+        "200":
+          description: Login flow started; ``authorize_url`` is ready.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HfAuthLoginStartResponse"
+        "403":
+          description: Deployment is not eligible for interactive HF login.
+        "409":
+          description: Another login attempt is already in progress.
+
+  /api/hf-auth-logout:
+    post:
+      operationId: postHfAuthLogout
+      tags: [model]
+      summary: Drop the stored HuggingFace OAuth token
+      description: Clears the in-memory cache and removes the on-disk token file.
+      responses:
+        "200":
+          description: Logged out (idempotent — succeeds even if no token was held).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HfAuthLogoutResponse"
+
   /api/cancel-model-download-session:
     post:
       operationId: postCancelModelDownloadSession
@@ -6280,11 +6340,12 @@ components:
 
     AvailabilityStatusResponse:
       type: object
-      description: Partitioned status of the requested models.
+      description: Partitioned status of the requested models + HF auth snapshot.
       required:
         - available
         - missing
         - downloading
+        - hf_auth
       properties:
         available:
           type: array
@@ -6301,6 +6362,22 @@ components:
           description: Model_ids currently downloading, with progress.
           items:
             $ref: "#/components/schemas/DownloadingEntry"
+        hf_auth:
+          $ref: "#/components/schemas/HfAuthStatus"
+
+    HfAuthStatus:
+      type: object
+      description: Inline snapshot of the server's HuggingFace OAuth state.
+      required:
+        - token_available
+        - eligible
+      properties:
+        token_available:
+          type: boolean
+          description: True iff a token (possibly expired but refreshable) is stored.
+        eligible:
+          type: boolean
+          description: True iff this deployment can surface interactive HF login.
 
     DownloadingEntry:
       type: object
@@ -6350,16 +6427,21 @@ components:
 
     MissingModelMetadataEntry:
       type: object
-      description: Per-model result of a HEAD probe against the declared URL.
+      description: Per-model result of probing the declared URL.
       properties:
         file_size:
           type: integer
           format: int64
           nullable: true
           description: Content-Length from the HEAD response, when readable.
-        is_gated:
+        is_hf_downloadable:
           type: boolean
-          description: True iff the URL is on huggingface.co and the HEAD returned 401/403/451.
+          nullable: true
+          description: |
+            HuggingFace-only signal. True if the server can fetch this
+            URL with its current auth state (public, or gated-with-access).
+            False if gated and lacking access. Null for non-HF URLs and
+            for HF URLs whose probe failed entirely.
 
     DownloadModelsRequest:
       type: object
@@ -6405,6 +6487,36 @@ components:
         - cancelled
       properties:
         cancelled:
+          type: boolean
+
+    HfAuthTokenStatusResponse:
+      type: object
+      description: Whether the server holds an HF OAuth token + resolved username.
+      required:
+        - token_available
+      properties:
+        token_available:
+          type: boolean
+        username:
+          type: string
+          nullable: true
+
+    HfAuthLoginStartResponse:
+      type: object
+      description: URL the frontend should open in a new tab to complete login.
+      required:
+        - authorize_url
+      properties:
+        authorize_url:
+          type: string
+
+    HfAuthLogoutResponse:
+      type: object
+      description: Result of the logout call (always logged_out = true).
+      required:
+        - logged_out
+      properties:
+        logged_out:
           type: boolean
 
     # -------------------------------------------------------------------

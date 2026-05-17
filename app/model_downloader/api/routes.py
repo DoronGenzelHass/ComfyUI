@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
+from typing import Any, Optional
 
 from aiohttp import web
 from pydantic import BaseModel, ValidationError
@@ -31,6 +31,12 @@ from app.model_downloader.download_server import (
 )
 from app.model_downloader.downloader import schedule_batch
 from app.model_downloader.gated_detection import probe_url
+from app.model_downloader.hf_auth.auth_store import HF_AUTH_STORE
+from app.model_downloader.hf_auth.eligibility import is_hf_auth_eligible
+from app.model_downloader.hf_auth.oauth import (
+    OAuthInProgressError,
+    start_login_flow,
+)
 from app.model_downloader.paths import (
     InvalidModelId,
     parse_model_id,
@@ -124,6 +130,10 @@ async def models_availability_status(request: web.Request) -> web.Response:
         available=available,
         missing=missing,
         downloading=downloading,
+        hf_auth=schemas_out.HfAuthStatus(
+            token_available=HF_AUTH_STORE.has_token(),
+            eligible=is_hf_auth_eligible(),
+        ),
     ))
 
 
@@ -146,7 +156,7 @@ async def missing_models_metadata(request: web.Request) -> web.Response:
     for (model_id, _url), probe in zip(items, results):
         metadata[model_id] = schemas_out.MissingModelMetadataEntry(
             file_size=probe.file_size,
-            is_gated=probe.is_gated,
+            is_hf_downloadable=probe.is_hf_downloadable,
         )
 
     return _ok(schemas_out.MissingModelsMetadataResponse(models=metadata))
@@ -195,14 +205,17 @@ async def download_models(request: web.Request) -> web.Response:
                           f"A download for {model_id} is already in progress.",
                           {"model_id": model_id})
 
-    # Gated check happens last because it's the only one that talks to
-    # the network. Concurrent HEADs.
+    # Reachability check last — it's the only one that talks to the
+    # network. Concurrent probes. For HF URLs ``is_hf_downloadable``
+    # reflects current token access; for non-HF URLs it's None, and we
+    # treat that as "no info, proceed".
     probes = await asyncio.gather(*(probe_url(url) for _, url in requested))
     for (model_id, url), probe in zip(requested, probes):
-        if probe.is_gated:
+        if probe.is_hf_downloadable is False:
             return _error(
-                400, "MODEL_GATED",
-                f"Model {model_id} is gated by its host; please acquire it manually.",
+                400, "MODEL_NOT_DOWNLOADABLE",
+                f"Model {model_id} is gated on HuggingFace and the current "
+                f"server token (if any) does not grant access.",
                 {"model_id": model_id, "url": url},
             )
 
@@ -235,6 +248,76 @@ async def download_models(request: web.Request) -> web.Response:
 
 
 # ----- 4. cancel a session -----
+
+
+# ----- 5. HuggingFace OAuth status / login start / logout -----
+
+
+@ROUTES.get("/api/hf-auth-token-status")
+async def hf_auth_token_status(request: web.Request) -> web.Response:
+    """Return whether the server holds a usable HF token + its username.
+
+    Used by the settings UI and (out-of-band) by the frontend on
+    login completion. ``token_available`` is true even if the cached
+    access_token is expired — as long as a refresh_token exists, the
+    user is "logged in" from their perspective.
+    """
+    token_present = HF_AUTH_STORE.has_token()
+    username: Optional[str] = None
+    if token_present:
+        # Resolve the username via whoami. Done in a worker thread because
+        # huggingface_hub's whoami is synchronous + blocks on a network call.
+        tok = await HF_AUTH_STORE.get_valid_token()
+        if tok is not None:
+            try:
+                username = await asyncio.to_thread(_whoami_username, tok.access_token)
+            except Exception as e:
+                logging.debug("[hf_auth] whoami failed: %s", e)
+    return _ok(schemas_out.HfAuthTokenStatusResponse(
+        token_available=token_present,
+        username=username,
+    ))
+
+
+def _whoami_username(token: str) -> Optional[str]:
+    """Sync helper: ask HF for the user name attached to a token."""
+    from huggingface_hub import HfApi
+    info = HfApi().whoami(token=token)
+    if isinstance(info, dict):
+        return info.get("name") or info.get("fullname")
+    return None
+
+
+@ROUTES.post("/api/hf-auth-login-start")
+async def hf_auth_login_start(request: web.Request) -> web.Response:
+    """Begin one OAuth attempt: bind the callback port, return the URL.
+
+    Rejected outright if this deployment isn't eligible (we don't
+    surface the option on multi-tenant / public-IP installs).
+    """
+    if not is_hf_auth_eligible():
+        return _error(
+            403, "HF_AUTH_NOT_ELIGIBLE",
+            "This server is not eligible for interactive HuggingFace login. "
+            "It must be bound to a loopback address and not running in "
+            "--multi-user mode.",
+        )
+    try:
+        url = await start_login_flow()
+    except OAuthInProgressError:
+        return _error(
+            409, "HF_AUTH_IN_PROGRESS",
+            "Another HuggingFace login attempt is in progress. Try again "
+            "after it completes or times out.",
+        )
+    return _ok(schemas_out.HfAuthLoginStartResponse(authorize_url=url))
+
+
+@ROUTES.post("/api/hf-auth-logout")
+async def hf_auth_logout(request: web.Request) -> web.Response:
+    """Drop the in-memory + on-disk HF token."""
+    HF_AUTH_STORE.clear()
+    return _ok(schemas_out.HfAuthLogoutResponse(logged_out=True))
 
 
 @ROUTES.post("/api/cancel-model-download-session")

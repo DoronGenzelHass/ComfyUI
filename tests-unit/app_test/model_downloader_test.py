@@ -334,7 +334,7 @@ async def test_download_rejects_gated_model(aiohttp_client, app):
     client = await aiohttp_client(app)
     with patch(
         "app.model_downloader.api.routes.probe_url",
-        new=AsyncMock(return_value=MetadataProbeResult(file_size=None, is_gated=True)),
+        new=AsyncMock(return_value=MetadataProbeResult(file_size=None, is_hf_downloadable=False)),
     ):
         resp = await client.post(
             "/api/download-models",
@@ -343,7 +343,7 @@ async def test_download_rejects_gated_model(aiohttp_client, app):
             }},
         )
     assert resp.status == 400
-    assert (await resp.json())["error"]["code"] == "MODEL_GATED"
+    assert (await resp.json())["error"]["code"] == "MODEL_NOT_DOWNLOADABLE"
 
 
 async def test_download_rejects_invalid_model_id(aiohttp_client, app):
@@ -398,7 +398,7 @@ async def test_download_schedules_when_all_preconditions_pass(
 
     with patch(
         "app.model_downloader.api.routes.probe_url",
-        new=AsyncMock(return_value=MetadataProbeResult(file_size=42, is_gated=False)),
+        new=AsyncMock(return_value=MetadataProbeResult(file_size=42, is_hf_downloadable=True)),
     ), patch(
         "app.model_downloader.downloader.stream_to_disk", new=fake_stream
     ):
@@ -461,9 +461,9 @@ async def test_metadata_dispatches_probes(aiohttp_client, app):
     fields. We stub the probe to keep it offline."""
     results = {
         "https://huggingface.co/a/b/resolve/main/free.safetensors":
-            MetadataProbeResult(file_size=1024, is_gated=False),
+            MetadataProbeResult(file_size=1024, is_hf_downloadable=True),
         "https://huggingface.co/g/r/resolve/main/gated.safetensors":
-            MetadataProbeResult(file_size=None, is_gated=True),
+            MetadataProbeResult(file_size=None, is_hf_downloadable=False),
     }
 
     async def fake_probe(url):
@@ -486,5 +486,5 @@ async def test_metadata_dispatches_probes(aiohttp_client, app):
         )
     assert resp.status == 200
     data = (await resp.json())["models"]
-    assert data["loras/free.safetensors"] == {"file_size": 1024, "is_gated": False}
-    assert data["loras/gated.safetensors"] == {"file_size": None, "is_gated": True}
+    assert data["loras/free.safetensors"] == {"file_size": 1024, "is_hf_downloadable": True}
+    assert data["loras/gated.safetensors"] == {"file_size": None, "is_hf_downloadable": False}

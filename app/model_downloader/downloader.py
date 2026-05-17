@@ -20,6 +20,8 @@ from app.model_downloader.download_server import (
     DownloadCancelled,
     DownloadSession,
 )
+from app.model_downloader.hf_auth.auth_store import HF_AUTH_STORE
+from app.model_downloader.hf_url import is_hf_url
 from app.model_downloader.http_client import get_session
 from app.model_downloader.paths import resolve_destination
 
@@ -47,7 +49,13 @@ async def stream_to_disk(session: DownloadSession) -> str:
     bytes_seen = 0
     try:
         http = await get_session()
-        async with http.get(session.url, allow_redirects=True, timeout=REQUEST_TIMEOUT) as resp:
+        headers = _auth_headers_for(session.url)
+        async with http.get(
+            session.url,
+            allow_redirects=True,
+            timeout=REQUEST_TIMEOUT,
+            headers=headers,
+        ) as resp:
             if resp.status != 200:
                 raise DownloadError(
                     f"unexpected HTTP {resp.status} fetching {session.url}",
@@ -118,6 +126,23 @@ def _parse_content_length(value: Optional[str]) -> Optional[int]:
     except ValueError:
         return None
     return n if n >= 0 else None
+
+
+def _auth_headers_for(url: str) -> dict[str, str]:
+    """Return any auth headers we should add to the GET for ``url``.
+
+    For HuggingFace URLs we inject the user's OAuth access token as a
+    Bearer header — this is HF's documented way to access gated repos
+    (see ``huggingface_hub.hf_hub_download``'s wire format). For every
+    other host we send no extra headers; allowlisted public files
+    don't need them and we don't want to leak tokens to other hosts.
+    """
+    if not is_hf_url(url):
+        return {}
+    tok = HF_AUTH_STORE.get_token_sync()
+    if tok is None or not tok.access_token:
+        return {}
+    return {"Authorization": f"Bearer {tok.access_token}"}
 
 
 def _remove_if_exists(path: str) -> None:

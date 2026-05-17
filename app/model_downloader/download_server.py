@@ -62,16 +62,21 @@ class DownloadServer:
         self._lock = threading.Lock()
         self._sessions: dict[str, DownloadSession] = {}
         self._epoch_counter = 0
-        self._cleanup_orphan_tmp_files()
+        self._orphan_sweep_done = False
 
     # ----- lifecycle -----
 
-    def _cleanup_orphan_tmp_files(self) -> None:
-        """Sweep ``*.tmp`` files left behind by crashed/restarted downloads.
+    def sweep_orphan_tmp_files(self) -> None:
+        """Idempotently sweep ``*.tmp`` files left by crashed downloads.
 
-        Safe at startup because no active download can have written a
-        ``.tmp`` yet — anything we find is by definition orphaned.
+        Deferred off the import path so module load doesn't block on
+        filesystem I/O against potentially-slow mounts. Each route handler
+        that might create a new ``.tmp`` runs this exactly once.
         """
+        with self._lock:
+            if self._orphan_sweep_done:
+                return
+            self._orphan_sweep_done = True
         for path in iter_all_tmp_paths():
             try:
                 os.remove(path)
@@ -151,6 +156,12 @@ class DownloadServer:
             if current is not None and current.epoch == session.epoch:
                 del self._sessions[session.model_id]
 
+    def reset_for_tests(self) -> None:
+        """Clear all sessions and reset the epoch counter. Test-only."""
+        with self._lock:
+            self._sessions.clear()
+            self._epoch_counter = 0
+
     def cancel(self, model_id: str) -> bool:
         """Remove the session registered for ``model_id``.
 
@@ -165,5 +176,4 @@ class DownloadServer:
             return False
 
 
-# The process-wide singleton. Imported wherever needed.
 DOWNLOAD_SERVER = DownloadServer()

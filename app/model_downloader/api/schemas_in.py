@@ -6,7 +6,7 @@ the boundary; route handlers operate only on validated values past that.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, conint
+from pydantic import BaseModel, Field
 
 
 class AvailabilityStatusRequest(BaseModel):
@@ -50,9 +50,3 @@ __all__ = [
     "DownloadModelsRequest",
     "CancelDownloadSessionRequest",
 ]
-
-
-# conint is re-exported here for parity with the assets schemas style;
-# unused at the moment but kept available for follow-up validations
-# (e.g. capping batch sizes).
-_ = conint

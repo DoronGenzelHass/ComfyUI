@@ -221,6 +221,7 @@ async def download_models(request: web.Request) -> web.Response:
                           {"model_id": model_id})
         sessions.append(session)
 
+    DOWNLOAD_SERVER.sweep_orphan_tmp_files()
     schedule_batch(sessions)
     logging.info(
         "[model_downloader] scheduled %d downloads: %s",

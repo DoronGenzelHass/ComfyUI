@@ -73,14 +73,12 @@ def patched_folder_paths(model_root):
 @pytest.fixture
 def fresh_download_server():
     """Reset the module-level singleton between tests so registry state
-    doesn't leak. We swap the dict + lock rather than re-importing the
-    module so all readers continue to see the same instance."""
-    from app.model_downloader import download_server as ds_mod
+    doesn't leak across tests sharing the singleton."""
+    from app.model_downloader.download_server import DOWNLOAD_SERVER
 
-    ds_mod.DOWNLOAD_SERVER._sessions.clear()
-    ds_mod.DOWNLOAD_SERVER._epoch_counter = 0
-    yield ds_mod.DOWNLOAD_SERVER
-    ds_mod.DOWNLOAD_SERVER._sessions.clear()
+    DOWNLOAD_SERVER.reset_for_tests()
+    yield DOWNLOAD_SERVER
+    DOWNLOAD_SERVER.reset_for_tests()
 
 
 @pytest.fixture
@@ -222,7 +220,7 @@ def test_update_progress_with_unknown_total_keeps_progress_none():
 
 
 def test_cleanup_orphan_tmp_files(model_root):
-    """Orphan .tmp left over from a crashed download must be swept at startup."""
+    """Orphan .tmp left by a crashed download must be swept on first use."""
     _root, loras_dir, _ = model_root
     orphan = loras_dir / "stale.safetensors.tmp"
     orphan.write_bytes(b"partial")
@@ -231,8 +229,12 @@ def test_cleanup_orphan_tmp_files(model_root):
         "folder_paths.get_folder_paths",
         side_effect=lambda name: mapping.get(name, ([], set()))[0],
     ):
-        DownloadServer()  # Construction triggers the sweep.
-    assert not orphan.exists()
+        server = DownloadServer()
+        assert orphan.exists(), "sweep must not run at construction time"
+        server.sweep_orphan_tmp_files()
+        assert not orphan.exists()
+        # Idempotent — a second call is a cheap no-op.
+        server.sweep_orphan_tmp_files()
 
 
 # --------------------------------------------------------------------------- #

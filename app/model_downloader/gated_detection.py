@@ -23,9 +23,11 @@ from typing import Optional
 
 import aiohttp
 
+from app.model_downloader.http_client import get_session
 
-# Same {401, 403, 451} set the frontend checks. Worth keeping as one
-# constant so the two sides cannot drift independently.
+
+# Same {401, 403, 451} set the frontend checks. Single constant so the
+# two sides cannot drift independently.
 _GATED_STATUS_CODES = frozenset({401, 403, 451})
 
 _HF_HOST_MARKER = "huggingface.co"
@@ -46,16 +48,16 @@ async def probe_url(url: str) -> MetadataProbeResult:
     errors — we never raise out of here.
     """
     try:
-        async with aiohttp.ClientSession(timeout=_HEAD_TIMEOUT) as session:
-            async with session.head(url, allow_redirects=True) as resp:
-                if resp.status == 200:
-                    return MetadataProbeResult(
-                        file_size=_parse_content_length(resp.headers.get("Content-Length")),
-                        is_gated=False,
-                    )
-                if resp.status in _GATED_STATUS_CODES and _HF_HOST_MARKER in url:
-                    return MetadataProbeResult(file_size=None, is_gated=True)
-                return MetadataProbeResult(file_size=None, is_gated=False)
+        session = await get_session()
+        async with session.head(url, allow_redirects=True, timeout=_HEAD_TIMEOUT) as resp:
+            if resp.status == 200:
+                return MetadataProbeResult(
+                    file_size=_parse_content_length(resp.headers.get("Content-Length")),
+                    is_gated=False,
+                )
+            if resp.status in _GATED_STATUS_CODES and _HF_HOST_MARKER in url:
+                return MetadataProbeResult(file_size=None, is_gated=True)
+            return MetadataProbeResult(file_size=None, is_gated=False)
     except (aiohttp.ClientError, TimeoutError, OSError):
         # Network blip / DNS failure / TLS issue: don't fail the whole
         # request, just report "unknown".

@@ -48,15 +48,11 @@ def parse_model_id(model_id: str) -> Tuple[str, str]:
 def resolve_existing(model_id: str) -> Optional[str]:
     """Return the absolute path of an installed model, or None if missing.
 
-    Searches every registered path for the directory (so it transparently
-    honours ``extra_model_paths.yaml``).
+    Honours ``extra_model_paths.yaml`` transparently via
+    ``folder_paths.get_full_path``.
     """
     directory, filename = parse_model_id(model_id)
-    for root in folder_paths.get_folder_paths(directory):
-        candidate = os.path.join(root, filename)
-        if os.path.isfile(candidate):
-            return candidate
-    return None
+    return folder_paths.get_full_path(directory, filename)
 
 
 def resolve_destination(model_id: str) -> Tuple[str, str]:

@@ -20,6 +20,7 @@ from app.model_downloader.download_server import (
     DownloadCancelled,
     DownloadSession,
 )
+from app.model_downloader.http_client import get_session
 from app.model_downloader.paths import resolve_destination
 
 
@@ -45,28 +46,28 @@ async def stream_to_disk(session: DownloadSession) -> str:
 
     bytes_seen = 0
     try:
-        async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as http:
-            async with http.get(session.url, allow_redirects=True) as resp:
-                if resp.status != 200:
-                    raise DownloadError(
-                        f"unexpected HTTP {resp.status} fetching {session.url}",
-                        status=resp.status,
-                    )
+        http = await get_session()
+        async with http.get(session.url, allow_redirects=True, timeout=REQUEST_TIMEOUT) as resp:
+            if resp.status != 200:
+                raise DownloadError(
+                    f"unexpected HTTP {resp.status} fetching {session.url}",
+                    status=resp.status,
+                )
 
-                total = _parse_content_length(resp.headers.get("Content-Length"))
-                DOWNLOAD_SERVER.update_progress(session, 0, total)
+            total = _parse_content_length(resp.headers.get("Content-Length"))
+            DOWNLOAD_SERVER.update_progress(session, 0, total)
 
-                with open(tmp_path, "wb") as f:
-                    async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
-                        # Cancellation check between chunks. Cheap and means
-                        # cancellation latency is bounded by one chunk plus
-                        # one ``write()`` — typically well under a second
-                        # even on slow disks.
-                        if not DOWNLOAD_SERVER.is_active(session):
-                            raise DownloadCancelled()
-                        f.write(chunk)
-                        bytes_seen += len(chunk)
-                        DOWNLOAD_SERVER.update_progress(session, bytes_seen, total)
+            with open(tmp_path, "wb") as f:
+                async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
+                    # Cancellation check between chunks. Cheap and means
+                    # cancellation latency is bounded by one chunk plus
+                    # one ``write()`` — typically well under a second
+                    # even on slow disks.
+                    if not DOWNLOAD_SERVER.is_active(session):
+                        raise DownloadCancelled()
+                    f.write(chunk)
+                    bytes_seen += len(chunk)
+                    DOWNLOAD_SERVER.update_progress(session, bytes_seen, total)
 
         # Final cancellation check before we promote the .tmp to the real
         # filename — avoids the awkward case where cancel arrives during

@@ -248,37 +248,49 @@ async def test_availability_partitions_correctly(
     _root, loras_dir, _ = model_root
     (loras_dir / "present.safetensors").write_bytes(b"x")
     fresh_download_server.try_register(
-        "loras/inflight.safetensors", "https://huggingface.co/x.safetensors"
+        "loras/inflight.safetensors", "http://localhost:8000/x.safetensors"
     )
     client = await aiohttp_client(app)
 
-    body = {
-        "model_ids": [
-            "loras/present.safetensors",
-            "loras/missing.safetensors",
-            "loras/inflight.safetensors",
-        ]
-    }
-    resp = await client.post("/api/models-availability-status", json=body)
+    # Stub probes — we're testing state assignment, not network calls.
+    with patch(
+        "app.model_downloader.api.routes.probe_url",
+        new=AsyncMock(return_value=MetadataProbeResult(
+            file_size=None, is_hf_downloadable=None,
+        )),
+    ):
+        body = {
+            "models": {
+                "loras/present.safetensors": "http://localhost:8000/p.safetensors",
+                "loras/missing.safetensors": "http://localhost:8000/m.safetensors",
+                "loras/inflight.safetensors": "http://localhost:8000/x.safetensors",
+            }
+        }
+        resp = await client.post("/api/models-availability-status", json=body)
     assert resp.status == 200
     data = await resp.json()
-    assert data["available"] == ["loras/present.safetensors"]
-    assert data["missing"] == ["loras/missing.safetensors"]
-    assert len(data["downloading"]) == 1
-    assert data["downloading"][0]["model_id"] == "loras/inflight.safetensors"
+    models = data["models"]
+    assert models["loras/present.safetensors"]["state"] == "available"
+    assert models["loras/missing.safetensors"]["state"] == "missing"
+    assert models["loras/inflight.safetensors"]["state"] == "downloading"
+    assert "hf_auth" in data
 
 
 async def test_availability_invalid_id_classified_as_missing(aiohttp_client, app):
     client = await aiohttp_client(app)
-    resp = await client.post(
-        "/api/models-availability-status",
-        json={"model_ids": ["../etc/passwd"]},
-    )
+    with patch(
+        "app.model_downloader.api.routes.probe_url",
+        new=AsyncMock(return_value=MetadataProbeResult(
+            file_size=None, is_hf_downloadable=None,
+        )),
+    ):
+        resp = await client.post(
+            "/api/models-availability-status",
+            json={"models": {"../etc/passwd": "http://localhost:8000/x.safetensors"}},
+        )
     assert resp.status == 200
     data = await resp.json()
-    assert data["missing"] == ["../etc/passwd"]
-    assert data["available"] == []
-    assert data["downloading"] == []
+    assert data["models"]["../etc/passwd"]["state"] == "missing"
 
 
 # --------------------------------------------------------------------------- #
@@ -452,13 +464,13 @@ async def test_cancel_returns_404_when_none(aiohttp_client, app):
 
 
 # --------------------------------------------------------------------------- #
-# Route: POST /api/missing-models-metadata
+# Unified availability response embeds metadata per id
 # --------------------------------------------------------------------------- #
 
 
-async def test_metadata_dispatches_probes(aiohttp_client, app):
-    """The metadata route HEADs every URL and returns the probed
-    fields. We stub the probe to keep it offline."""
+async def test_availability_embeds_metadata(aiohttp_client, app):
+    """``file_size`` + ``is_hf_downloadable`` come back on the same
+    request as the state — no separate metadata endpoint."""
     results = {
         "https://huggingface.co/a/b/resolve/main/free.safetensors":
             MetadataProbeResult(file_size=1024, is_hf_downloadable=True),
@@ -474,7 +486,7 @@ async def test_metadata_dispatches_probes(aiohttp_client, app):
     ):
         client = await aiohttp_client(app)
         resp = await client.post(
-            "/api/missing-models-metadata",
+            "/api/models-availability-status",
             json={
                 "models": {
                     "loras/free.safetensors":
@@ -485,6 +497,8 @@ async def test_metadata_dispatches_probes(aiohttp_client, app):
             },
         )
     assert resp.status == 200
-    data = (await resp.json())["models"]
-    assert data["loras/free.safetensors"] == {"file_size": 1024, "is_hf_downloadable": True}
-    assert data["loras/gated.safetensors"] == {"file_size": None, "is_hf_downloadable": False}
+    models = (await resp.json())["models"]
+    assert models["loras/free.safetensors"]["file_size"] == 1024
+    assert models["loras/free.safetensors"]["is_hf_downloadable"] is True
+    assert models["loras/gated.safetensors"]["file_size"] is None
+    assert models["loras/gated.safetensors"]["is_hf_downloadable"] is False

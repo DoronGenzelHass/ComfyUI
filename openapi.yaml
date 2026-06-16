@@ -884,14 +884,24 @@ paths:
     post:
       operationId: postModelsAvailabilityStatus
       tags: [model]
-      summary: Bulk check whether models are available, missing, or being downloaded
+      summary: Unified per-model status + metadata for the polling UI
       description: |
-        Given a list of model_ids (each of the form `<directory>/<filename>`,
-        e.g. `loras/my_lora.safetensors`), returns three lists partitioning
-        them: `available` (already on disk), `missing` (not on disk and not
-        being downloaded), and `downloading` (in-flight on the server, with
-        per-session progress). The frontend uses this to drive a missing-models
-        UI without polling the filesystem itself.
+        Given a map of `{model_id: url}` (model_id is
+        `<directory>/<filename>`), returns per-id state plus the
+        metadata the UI needs to render the row:
+
+          - `state` — one of `available` / `missing` / `downloading`
+          - `progress` — embedded when `state == downloading`
+          - `file_size` — bytes (when known)
+          - `is_hf_downloadable` — for HF URLs only: true if the
+            server can currently fetch the file with its stored auth
+            state, false if gated and lacking access, null otherwise
+
+        Designed for 1 Hz polling. ``file_size`` and the intrinsic
+        "is this model gated" check are cached server-side per URL;
+        ``is_hf_downloadable`` is recomputed per call so license
+        acceptance and login/logout transitions show up within one
+        poll interval without any client-side cache plumbing.
       requestBody:
         required: true
         content:
@@ -900,37 +910,11 @@ paths:
               $ref: "#/components/schemas/AvailabilityStatusRequest"
       responses:
         "200":
-          description: Partitioned status of the requested models.
+          description: Per-model status and metadata.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AvailabilityStatusResponse"
-        "400":
-          description: Malformed request body.
-
-  /api/missing-models-metadata:
-    post:
-      operationId: postMissingModelsMetadata
-      tags: [model]
-      summary: Probe remote URLs for file size and gated status
-      description: |
-        Takes a map of model_id → URL and HEAD-checks each URL to surface its
-        `Content-Length` and whether the host is gating the file (e.g. a
-        HuggingFace 401/403 response). Used by the frontend to render
-        appropriately on the missing-models card.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/MissingModelsMetadataRequest"
-      responses:
-        "200":
-          description: Per-model metadata.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/MissingModelsMetadataResponse"
         "400":
           description: Malformed request body.
 
@@ -6328,40 +6312,30 @@ components:
     # -------------------------------------------------------------------
     AvailabilityStatusRequest:
       type: object
-      description: Model_ids to query for availability/in-progress state.
-      properties:
-        model_ids:
-          type: array
-          description: List of `<directory>/<filename>` identifiers.
-          items:
-            type: string
+      description: |
+        Models to query — each entry is `model_id → URL`. The URL lets
+        the server compute file_size + is_hf_downloadable on the same
+        request, eliminating the need for a separate metadata endpoint.
       required:
-        - model_ids
+        - models
+      properties:
+        models:
+          type: object
+          additionalProperties:
+            type: string
+          description: model_id → URL declared in the workflow.
 
     AvailabilityStatusResponse:
       type: object
-      description: Partitioned status of the requested models + HF auth snapshot.
+      description: Per-model state + metadata + HF auth snapshot.
       required:
-        - available
-        - missing
-        - downloading
+        - models
         - hf_auth
       properties:
-        available:
-          type: array
-          description: Model_ids already present on disk.
-          items:
-            type: string
-        missing:
-          type: array
-          description: Model_ids not on disk and not being downloaded.
-          items:
-            type: string
-        downloading:
-          type: array
-          description: Model_ids currently downloading, with progress.
-          items:
-            $ref: "#/components/schemas/DownloadingEntry"
+        models:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/ModelStatusEntry"
         hf_auth:
           $ref: "#/components/schemas/HfAuthStatus"
 
@@ -6379,61 +6353,28 @@ components:
           type: boolean
           description: True iff this deployment can surface interactive HF login.
 
-    DownloadingEntry:
+    ModelStatusEntry:
       type: object
-      description: In-flight download progress for a single model_id.
+      description: Everything the UI needs to render one row of the model.
       required:
-        - model_id
-        - bytes_downloaded
+        - state
       properties:
-        model_id:
+        state:
           type: string
+          enum: [available, missing, downloading]
+          description: |
+            `available` — file is on disk.
+            `missing` — not on disk and no download in flight.
+            `downloading` — server is currently fetching the file.
         progress:
-          type: number
-          format: float
+          $ref: "#/components/schemas/DownloadProgress"
           nullable: true
-          description: Fraction in [0,1]; null until Content-Length is known.
-        bytes_downloaded:
-          type: integer
-          format: int64
-        total_bytes:
-          type: integer
-          format: int64
-          nullable: true
-          description: Content-Length when supplied by the server.
-
-    MissingModelsMetadataRequest:
-      type: object
-      description: Map of model_id → URL to probe.
-      required:
-        - models
-      properties:
-        models:
-          type: object
-          additionalProperties:
-            type: string
-          description: model_id → URL.
-
-    MissingModelsMetadataResponse:
-      type: object
-      description: Probe results keyed by model_id.
-      required:
-        - models
-      properties:
-        models:
-          type: object
-          additionalProperties:
-            $ref: "#/components/schemas/MissingModelMetadataEntry"
-
-    MissingModelMetadataEntry:
-      type: object
-      description: Per-model result of probing the declared URL.
-      properties:
+          description: Present when `state == downloading`.
         file_size:
           type: integer
           format: int64
           nullable: true
-          description: Content-Length from the HEAD response, when readable.
+          description: Bytes, when known. Cached server-side per URL.
         is_hf_downloadable:
           type: boolean
           nullable: true
@@ -6442,6 +6383,26 @@ components:
             URL with its current auth state (public, or gated-with-access).
             False if gated and lacking access. Null for non-HF URLs and
             for HF URLs whose probe failed entirely.
+
+    DownloadProgress:
+      type: object
+      description: In-flight download progress; embedded in ModelStatusEntry.
+      required:
+        - bytes_downloaded
+      properties:
+        bytes_downloaded:
+          type: integer
+          format: int64
+        total_bytes:
+          type: integer
+          format: int64
+          nullable: true
+          description: Content-Length when supplied by the source.
+        progress:
+          type: number
+          format: float
+          nullable: true
+          description: Fraction in [0,1]; null until total_bytes is known.
 
     DownloadModelsRequest:
       type: object

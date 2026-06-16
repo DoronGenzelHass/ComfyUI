@@ -12,20 +12,10 @@ from pydantic import BaseModel, Field
 class AvailabilityStatusRequest(BaseModel):
     """``POST /api/models-availability-status``.
 
-    Sent by the frontend on each poll. Lists the model_ids it cares
-    about (i.e. the ones declared by the loaded workflow). The server's
-    response only mentions those ids — other in-flight downloads on
-    the server are not leaked.
-    """
-    model_ids: list[str] = Field(default_factory=list)
-
-
-class MissingModelsMetadataRequest(BaseModel):
-    """``POST /api/missing-models-metadata``.
-
-    Maps model_id → URL for each model the frontend wants metadata on.
-    The URL is the one declared in ``properties.models[i].url`` in the
-    workflow JSON.
+    Sent by the frontend on each poll. Each entry is ``{model_id: url}``;
+    the URL is the one declared in ``properties.models[i].url`` in the
+    workflow JSON and lets the server compute per-id metadata
+    (``file_size`` + ``is_hf_downloadable``) on the same request.
     """
     models: dict[str, str] = Field(default_factory=dict)
 
@@ -46,7 +36,6 @@ class CancelDownloadSessionRequest(BaseModel):
 
 __all__ = [
     "AvailabilityStatusRequest",
-    "MissingModelsMetadataRequest",
     "DownloadModelsRequest",
     "CancelDownloadSessionRequest",
 ]

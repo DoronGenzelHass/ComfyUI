@@ -55,12 +55,16 @@ def patched_user_dir(tmp_path):
 
 @pytest.fixture
 def fresh_auth_store():
-    """Wipe the singleton between tests."""
+    """Wipe singleton state between tests: auth + probe caches."""
+    from app.model_downloader import gated_detection
+
     HF_AUTH_STORE._token = None
     HF_AUTH_STORE._loaded_from_disk = False
+    gated_detection.clear_caches_for_tests()
     yield HF_AUTH_STORE
     HF_AUTH_STORE._token = None
     HF_AUTH_STORE._loaded_from_disk = False
+    gated_detection.clear_caches_for_tests()
 
 
 @pytest.fixture
@@ -280,7 +284,7 @@ async def test_probe_url_hf_public(fresh_auth_store):
 
     url = "https://huggingface.co/public/repo/resolve/main/x.safetensors"
     with patch("app.model_downloader.gated_detection._auth_check_sync"), patch(
-        "app.model_downloader.gated_detection._probe_size",
+        "app.model_downloader.gated_detection._probe_size_once",
         new=AsyncMock(return_value=1024),
     ):
         result = await probe_url(url)
@@ -300,7 +304,7 @@ async def test_probe_url_hf_gated_no_access(fresh_auth_store):
         "app.model_downloader.gated_detection._auth_check_sync",
         side_effect=GatedRepoError("gated", response=fake_response),
     ), patch(
-        "app.model_downloader.gated_detection._probe_size",
+        "app.model_downloader.gated_detection._probe_size_once",
         new=AsyncMock(return_value=None),
     ):
         result = await probe_url(url)
@@ -315,7 +319,7 @@ async def test_probe_url_non_hf_skips_auth_check():
     with patch(
         "app.model_downloader.gated_detection._auth_check_sync",
     ) as mocked, patch(
-        "app.model_downloader.gated_detection._probe_size",
+        "app.model_downloader.gated_detection._probe_size_once",
         new=AsyncMock(return_value=2048),
     ):
         result = await probe_url(url)
@@ -324,24 +328,109 @@ async def test_probe_url_non_hf_skips_auth_check():
     mocked.assert_not_called()
 
 
-async def test_probe_url_passes_token_when_available(fresh_auth_store, patched_user_dir):
-    """auth_check is called with the stored token's access_token."""
+async def test_is_gated_cached_across_calls(fresh_auth_store):
+    """Intrinsic ``is_gated`` should be determined exactly once per URL.
+
+    Subsequent ``probe_url`` calls for the same URL must not re-issue
+    the null-token auth_check — that's the whole point of the cache."""
     from app.model_downloader.gated_detection import probe_url
 
+    url = "https://huggingface.co/public/repo/resolve/main/x.safetensors"
+    with patch(
+        "app.model_downloader.gated_detection._auth_check_sync"
+    ) as mocked, patch(
+        "app.model_downloader.gated_detection._probe_size_once",
+        new=AsyncMock(return_value=1024),
+    ):
+        await probe_url(url)
+        await probe_url(url)
+        await probe_url(url)
+    # Three probe_url calls × public-only-needs-1-auth_check = 1 call total.
+    assert mocked.call_count == 1
+
+
+async def test_file_size_cached_across_calls(fresh_auth_store):
+    """Once a successful HEAD lands, subsequent calls don't re-HEAD."""
+    from app.model_downloader.gated_detection import probe_url
+
+    url = "https://huggingface.co/public/repo/resolve/main/x.safetensors"
+    with patch(
+        "app.model_downloader.gated_detection._auth_check_sync"
+    ), patch(
+        "app.model_downloader.gated_detection._probe_size_once",
+        new=AsyncMock(return_value=2048),
+    ) as size_probe:
+        r1 = await probe_url(url)
+        r2 = await probe_url(url)
+    assert r1.file_size == 2048
+    assert r2.file_size == 2048
+    assert size_probe.call_count == 1
+
+
+async def test_file_size_not_probed_for_gated_no_access(fresh_auth_store):
+    """When ``is_hf_downloadable`` is False we must NOT HEAD the URL —
+    otherwise a 401-due-to-gating would land as a cached ``None`` that
+    survives a later successful login."""
+    from app.model_downloader.gated_detection import probe_url
+    from huggingface_hub.errors import GatedRepoError
+    from unittest.mock import MagicMock
+
+    url = "https://huggingface.co/gated/repo/resolve/main/x.safetensors"
+    fake_resp = MagicMock(status_code=403)
+    with patch(
+        "app.model_downloader.gated_detection._auth_check_sync",
+        side_effect=GatedRepoError("gated", response=fake_resp),
+    ), patch(
+        "app.model_downloader.gated_detection._probe_size_once",
+        new=AsyncMock(return_value=None),
+    ) as size_probe:
+        result = await probe_url(url)
+    assert result.is_hf_downloadable is False
+    assert result.file_size is None
+    assert size_probe.call_count == 0
+
+
+async def test_probe_url_passes_token_when_available(fresh_auth_store, patched_user_dir):
+    """For a gated URL, auth_check runs twice: once with token=None to
+    determine the intrinsic ``is_gated`` flag (cached forever), and once
+    with the stored access_token to determine ``is_hf_downloadable`` for
+    the current user."""
+    from app.model_downloader import gated_detection
+    from app.model_downloader.gated_detection import probe_url
+    from huggingface_hub.errors import GatedRepoError
+    from unittest.mock import MagicMock
+
+    gated_detection.clear_caches_for_tests()
     fresh_auth_store.set_token(Token(
         access_token="hf_test_token",
         refresh_token=None,
         expires_at=9999999999.0,
     ))
     url = "https://huggingface.co/private/repo/resolve/main/x.safetensors"
+
+    fake_resp = MagicMock(status_code=403)
+
+    def fake_auth_check(repo_id, token):
+        # Null-token call → repo is gated. Subsequent call with the real
+        # token succeeds (user has access).
+        if token is None:
+            raise GatedRepoError("gated", response=fake_resp)
+
     with patch(
-        "app.model_downloader.gated_detection._auth_check_sync"
+        "app.model_downloader.gated_detection._auth_check_sync",
+        side_effect=fake_auth_check,
     ) as mocked, patch(
-        "app.model_downloader.gated_detection._probe_size",
+        "app.model_downloader.gated_detection._probe_size_once",
         new=AsyncMock(return_value=None),
     ):
-        await probe_url(url)
-    mocked.assert_called_once_with("private/repo", "hf_test_token")
+        result = await probe_url(url)
+
+    # is_hf_downloadable should be True (token-authed call succeeded).
+    assert result.is_hf_downloadable is True
+    # Two calls: (repo_id, None) then (repo_id, <token>).
+    assert mocked.call_count == 2
+    assert mocked.call_args_list[0].args == ("private/repo", None)
+    assert mocked.call_args_list[1].args == ("private/repo", "hf_test_token")
 
 
 # --------------------------------------------------------------------------- #
@@ -470,7 +559,7 @@ async def test_availability_includes_hf_auth_snapshot(aiohttp_client, app, monke
     client = await aiohttp_client(app)
     resp = await client.post(
         "/api/models-availability-status",
-        json={"model_ids": []},
+        json={"models": {}},
     )
     assert resp.status == 200
     data = await resp.json()

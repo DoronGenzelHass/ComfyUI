@@ -12,9 +12,9 @@ validates ``state`` (CSRF), exchanges the code for tokens via PKCE,
 hands the resulting Token to ``HF_AUTH_STORE.set_token``, and shuts
 itself down.
 
-# TODO: register a dedicated ComfyUI-Org OAuth app on huggingface.co
-# and replace ``HF_CLIENT_ID`` + ``REDIRECT_URI`` below. For the POC we
-# reuse the LTX model-downloader node's registered OAuth app.
+Before this can be exercised end-to-end a maintainer must register a
+HuggingFace OAuth app and substitute the ``HF_CLIENT_ID`` placeholder
+below. See the comment above the constant for the exact steps.
 """
 
 from __future__ import annotations
@@ -35,9 +35,22 @@ from app.model_downloader.hf_auth.token_store import Token
 
 
 # --- HF OAuth app registration -------------------------------------------- #
-# Reusing the LTX model-downloader node's client_id for the POC. See module
-# docstring.
-HF_CLIENT_ID = "a8189e14-9246-4f19-bd6a-a307bdcb9276"
+# NOTE: The OAuth client_id below is a placeholder. Before this feature can be
+# exercised end-to-end, a maintainer must register a HuggingFace OAuth app
+# under a Comfy-Org-controlled HF account and substitute its client_id here.
+# Detailed walkthrough is in docs/server-side-model-downloads-handover.html
+# ("HuggingFace OAuth app setup" section). Short version:
+#   1. huggingface.co → Settings → Connected Apps → "Create app"
+#   2. Default Scopes: check ``openid`` + ``profile`` (User Info) and
+#      ``gated-repos`` (Repository Access). Leave everything else off.
+#   3. Redirect URLs: exactly ``http://127.0.0.1:41954/api/auth/huggingface/callback``
+#      — must match ``REDIRECT_URI`` below; change both in lockstep if you
+#      change ``CALLBACK_PORT``.
+#   4. Save → copy the resulting Client ID into ``HF_CLIENT_ID`` below.
+# The client_id is not a secret (it travels through the user's browser in
+# plaintext); HF's "Public app" type means there's no client secret to
+# manage — PKCE replaces it.
+HF_CLIENT_ID = "REPLACE_ME_WITH_COMFY_ORG_HF_OAUTH_CLIENT_ID"
 
 CALLBACK_HOST = "127.0.0.1"
 CALLBACK_PORT = 41954
@@ -46,7 +59,18 @@ REDIRECT_URI = f"http://{CALLBACK_HOST}:{CALLBACK_PORT}{CALLBACK_PATH}"
 
 AUTHORIZE_URL = "https://huggingface.co/oauth/authorize"
 TOKEN_URL = "https://huggingface.co/oauth/token"
-SCOPE = "openid profile read-repos"
+# Minimal scope set for the feature:
+#   - openid       : required by HF when the app uses OIDC at all
+#   - profile      : lets ``HfApi.whoami(token=...)`` return a username for the
+#                    settings UI; cosmetic but expected
+#   - gated-repos  : grants the token enough to call ``auth_check`` and
+#                    download files from public gated repos the user has
+#                    accepted the license for. The wider ``read-repos`` scope
+#                    would also work (it includes ``gated-repos``) but it
+#                    additionally grants private-repo read access, which we
+#                    don't need and which makes the consent screen scarier
+#                    for the user.
+SCOPE = "openid profile gated-repos"
 
 # Maximum time the callback server stays up waiting for the user to
 # complete consent on huggingface.co. Past this, the port closes and

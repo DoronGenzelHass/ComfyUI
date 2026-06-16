@@ -88,48 +88,68 @@ async def _parse_body(request: web.Request, model: type[BaseModel]) -> Any:
         return _validation_error("INVALID_BODY", ve)
 
 
-# ----- 1. availability status -----
+# ----- 1. availability status (unified: state + metadata per id) -----
 
 
 @ROUTES.post("/api/models-availability-status")
 async def models_availability_status(request: web.Request) -> web.Response:
+    """Return per-id ``{state, progress, file_size, is_hf_downloadable}``.
+
+    State (``available`` / ``missing`` / ``downloading``) is cheap to
+    recompute per call. ``file_size`` and ``is_gated`` are cached
+    server-side per URL. ``is_hf_downloadable`` is recomputed every
+    call from the current token state — that's what makes login + license
+    acceptance show up in the UI within one poll cycle without any
+    frontend cache plumbing.
+    """
     parsed = await _parse_body(request, schemas_in.AvailabilityStatusRequest)
     if isinstance(parsed, web.Response):
         return parsed
 
-    available: list[str] = []
-    missing: list[str] = []
-    downloading: list[schemas_out.DownloadingEntry] = []
+    items = list(parsed.models.items())
 
-    for model_id in parsed.model_ids:
+    # Run all probes concurrently; each is internally cached per URL.
+    probes = await asyncio.gather(*(probe_url(url) for _, url in items))
+
+    response_models: dict[str, schemas_out.ModelStatusEntry] = {}
+    for (model_id, _url), probe in zip(items, probes):
         try:
             parse_model_id(model_id)
         except InvalidModelId:
-            # Ill-formed identifier: treat as "not on disk, not downloading"
-            # so the frontend can surface it as missing without us 400-ing
-            # the whole batch.
-            missing.append(model_id)
+            # Ill-formed identifier: report as missing without 400-ing the
+            # whole batch — the workflow author probably typo'd.
+            response_models[model_id] = schemas_out.ModelStatusEntry(
+                state="missing",
+                file_size=probe.file_size,
+                is_hf_downloadable=probe.is_hf_downloadable,
+            )
             continue
 
         active = DOWNLOAD_SERVER.get(model_id)
         if active is not None:
-            downloading.append(schemas_out.DownloadingEntry(
-                model_id=model_id,
-                progress=active.progress,
-                bytes_downloaded=active.bytes_downloaded,
-                total_bytes=active.total_bytes,
-            ))
+            response_models[model_id] = schemas_out.ModelStatusEntry(
+                state="downloading",
+                progress=schemas_out.DownloadProgress(
+                    bytes_downloaded=active.bytes_downloaded,
+                    total_bytes=active.total_bytes,
+                    progress=active.progress,
+                ),
+                file_size=probe.file_size,
+                is_hf_downloadable=probe.is_hf_downloadable,
+            )
             continue
 
-        if resolve_existing(model_id) is not None:
-            available.append(model_id)
-        else:
-            missing.append(model_id)
+        state: schemas_out.ModelState = (
+            "available" if resolve_existing(model_id) is not None else "missing"
+        )
+        response_models[model_id] = schemas_out.ModelStatusEntry(
+            state=state,
+            file_size=probe.file_size,
+            is_hf_downloadable=probe.is_hf_downloadable,
+        )
 
     return _ok(schemas_out.AvailabilityStatusResponse(
-        available=available,
-        missing=missing,
-        downloading=downloading,
+        models=response_models,
         hf_auth=schemas_out.HfAuthStatus(
             token_available=HF_AUTH_STORE.has_token(),
             eligible=is_hf_auth_eligible(),
@@ -137,32 +157,7 @@ async def models_availability_status(request: web.Request) -> web.Response:
     ))
 
 
-# ----- 2. missing-models metadata -----
-
-
-@ROUTES.post("/api/missing-models-metadata")
-async def missing_models_metadata(request: web.Request) -> web.Response:
-    parsed = await _parse_body(request, schemas_in.MissingModelsMetadataRequest)
-    if isinstance(parsed, web.Response):
-        return parsed
-
-    # Probe each URL concurrently. Each probe handles its own errors and
-    # returns a result-shaped object, so gather() can use return_exceptions=False
-    # without us having to write per-task try/except wrappers.
-    items = list(parsed.models.items())
-    results = await asyncio.gather(*(probe_url(url) for _, url in items))
-
-    metadata: dict[str, schemas_out.MissingModelMetadataEntry] = {}
-    for (model_id, _url), probe in zip(items, results):
-        metadata[model_id] = schemas_out.MissingModelMetadataEntry(
-            file_size=probe.file_size,
-            is_hf_downloadable=probe.is_hf_downloadable,
-        )
-
-    return _ok(schemas_out.MissingModelsMetadataResponse(models=metadata))
-
-
-# ----- 3. start downloads -----
+# ----- 2. start downloads -----
 
 
 @ROUTES.post("/api/download-models")

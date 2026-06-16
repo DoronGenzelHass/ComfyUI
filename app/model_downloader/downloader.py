@@ -50,6 +50,10 @@ async def stream_to_disk(session: DownloadSession) -> str:
     try:
         http = await get_session()
         headers = _auth_headers_for(session.url)
+        logging.info(
+            "[model_downloader] starting GET %s (auth=%s)",
+            session.url, "yes" if "Authorization" in headers else "no",
+        )
         async with http.get(
             session.url,
             allow_redirects=True,
@@ -57,8 +61,16 @@ async def stream_to_disk(session: DownloadSession) -> str:
             headers=headers,
         ) as resp:
             if resp.status != 200:
+                # Capture a snippet of the response body so 4xx/5xx aren't
+                # opaque in the logs — HF returns JSON or HTML with a
+                # human-readable reason on failures.
+                body_snippet = await _read_short(resp)
+                logging.warning(
+                    "[model_downloader] GET %s failed: status=%d final_url=%s body=%s",
+                    session.url, resp.status, str(resp.url), body_snippet,
+                )
                 raise DownloadError(
-                    f"unexpected HTTP {resp.status} fetching {session.url}",
+                    f"unexpected HTTP {resp.status} fetching {session.url}: {body_snippet}",
                     status=resp.status,
                 )
 
@@ -98,8 +110,9 @@ async def stream_to_disk(session: DownloadSession) -> str:
         raise
     except Exception as e:
         logging.warning(
-            "[model_downloader] failed: %s from %s: %s",
-            session.model_id, session.url, e,
+            "[model_downloader] failed: %s from %s: %s: %s",
+            session.model_id, session.url, type(e).__name__, e,
+            exc_info=True,
         )
         _remove_if_exists(tmp_path)
         raise
@@ -126,6 +139,20 @@ def _parse_content_length(value: Optional[str]) -> Optional[int]:
     except ValueError:
         return None
     return n if n >= 0 else None
+
+
+async def _read_short(resp: aiohttp.ClientResponse, limit: int = 512) -> str:
+    """Read up to ``limit`` bytes of a response body for logging.
+
+    Used to surface the JSON/HTML reason from an HF non-2xx response in
+    server logs instead of just the status code. Best-effort: any
+    error here is swallowed.
+    """
+    try:
+        raw = await resp.content.read(limit)
+        return raw.decode("utf-8", errors="replace").strip()
+    except Exception:
+        return "<unreadable>"
 
 
 def _auth_headers_for(url: str) -> dict[str, str]:
